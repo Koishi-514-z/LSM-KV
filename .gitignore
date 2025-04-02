@@ -1,0 +1,38 @@
+# Ignore build directories
+/build/
+/data/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+
+# Ignore executables and libraries
+*.exe
+*.out
+*.app
+*.log
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Ignore generated files
+*.o
+*.obj
+*.gch
+
+# Ignore IDE specific files
+.idea/
+.vscode/
+*.swp
+
+# Ignore OS specific files
+.DS_Store
+Thumbs.db
+
+persistence
+bench
+correctness
+
+model

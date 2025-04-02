@@ -1,0 +1,589 @@
+diff --git a/.gitignore b/.gitignore
+index e26b5ff..76dac68 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -34,3 +34,5 @@ Thumbs.db
+ persistence
+ bench
+ correctness
++
++model
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 554a4fd..ca8c8ae 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,9 @@
+-set(CMAKE_CXX_FLAGS -std=c++17)
++cmake_minimum_required(VERSION 3.10)
++project(LSM_TREE)
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+ add_executable(correctness correctness.cc kvstore_api.h kvstore.h
+         kvstore.cc skiplist.cpp skiplist.h sstable.cpp sstable.h
+@@ -8,4 +13,10 @@ add_executable(correctness correctness.cc kvstore_api.h kvstore.h
+ add_executable(persistence persistence.cc kvstore_api.h kvstore.h kvstore.cc
+         skiplist.cpp skiplist.h sstable.cpp sstable.h
+         bloom.cpp bloom.h MurmurHash3.h utils.h test.h
+-        sstablehead.cpp sstablehead.h)
+\ No newline at end of file
++        sstablehead.cpp sstablehead.h)
++
++add_subdirectory(third_party/llama.cpp)
++
++add_subdirectory(embedding)
++
++add_subdirectory(test)
+diff --git a/embedding/CMakeLists.txt b/embedding/CMakeLists.txt
+new file mode 100644
+index 0000000..c4f3a4f
+--- /dev/null
++++ b/embedding/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_library(embedding STATIC embedding.cc)
++
++target_link_libraries(embedding PUBLIC llama common)
++
++target_include_directories(embedding PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+diff --git a/embedding/embedding.cc b/embedding/embedding.cc
+new file mode 100644
+index 0000000..1cad198
+--- /dev/null
++++ b/embedding/embedding.cc
+@@ -0,0 +1,277 @@
++#include "embedding.h"
++
++#if defined(_MSC_VER)
++#pragma warning(disable : 4244 4267)  // possible loss of data
++#endif
++
++const int NGL = 99;
++const std::string MODEL = "./model/nomic-embed-text-v1.5.Q8_0.gguf";
++const int CONTEXT_SIZE = 2048;
++const int BATCH_SIZE = 2048;
++const int ROPE_SCALING_YARN = 1;
++const float ROPE_FREQ_SCALE = 0.75;
++
++std::string join(const std::vector<std::string>& vec,
++                 const std::string& delimiter) {
++  if (vec.empty()) return "";
++  return std::accumulate(
++      vec.begin() + 1, vec.end(), vec[0],
++      [&delimiter](const std::string& a, const std::string& b) {
++        return a + delimiter + b;
++      });
++}
++
++static std::vector<std::string> split_lines(
++    const std::string& s, const std::string& separator = "\n") {
++  std::vector<std::string> lines;
++  size_t start = 0;
++  size_t end = s.find(separator);
++
++  while (end != std::string::npos) {
++    lines.push_back(s.substr(start, end - start));
++    start = end + separator.length();
++    end = s.find(separator, start);
++  }
++
++  lines.push_back(s.substr(start));  // Add the last part
++
++  return lines;
++}
++
++static void batch_add_seq(llama_batch& batch,
++                          const std::vector<int32_t>& tokens,
++                          llama_seq_id seq_id) {
++  size_t n_tokens = tokens.size();
++  for (size_t i = 0; i < n_tokens; i++) {
++    common_batch_add(batch, tokens[i], i, {seq_id}, true);
++  }
++}
++
++static void batch_decode(llama_context* ctx, llama_batch& batch, float* output,
++                         int n_seq, int n_embd, int embd_norm) {
++  const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
++  const struct llama_model* model = llama_get_model(ctx);
++
++  // clear previous kv_cache values (irrelevant for embeddings)
++  llama_kv_self_clear(ctx);
++
++  // run model
++  LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
++  if (llama_model_has_encoder(model) && !llama_model_has_decoder(model)) {
++    // encoder-only model
++    if (llama_encode(ctx, batch) < 0) {
++      LOG_ERR("%s : failed to encode\n", __func__);
++    }
++  } else if (!llama_model_has_encoder(model) &&
++             llama_model_has_decoder(model)) {
++    // decoder-only model
++    if (llama_decode(ctx, batch) < 0) {
++      LOG_ERR("%s : failed to decode\n", __func__);
++    }
++  }
++
++  for (int i = 0; i < batch.n_tokens; i++) {
++    if (!batch.logits[i]) {
++      continue;
++    }
++
++    const float* embd = nullptr;
++    int embd_pos = 0;
++
++    if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
++      // try to get token embeddings
++      embd = llama_get_embeddings_ith(ctx, i);
++      embd_pos = i;
++      GGML_ASSERT(embd != NULL && "failed to get token embeddings");
++    } else {
++      // try to get sequence embeddings - supported only when pooling_type is
++      // not NONE
++      embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
++      embd_pos = batch.seq_id[i][0];
++      GGML_ASSERT(embd != NULL && "failed to get sequence embeddings");
++    }
++
++    float* out = output + embd_pos * n_embd;
++    common_embd_normalize(embd, out, n_embd, embd_norm);
++  }
++}
++
++int embedding_utils(const std::string& prompt, std::vector<float>& embeddings,
++                    int& n_embd, int& n_prompts) {
++  common_params params;
++
++  common_init();
++
++  params.model = MODEL;
++
++  params.n_gpu_layers = NGL;
++
++  params.n_batch = BATCH_SIZE;
++
++  params.n_ctx = CONTEXT_SIZE;
++
++  params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN;
++
++  params.rope_freq_scale = ROPE_FREQ_SCALE;
++
++  params.embedding = true;
++  // For non-causal models, batch size must be equal to ubatch size
++  params.n_ubatch = params.n_batch;
++
++  params.verbose_prompt = GGML_LOG_LEVEL_ERROR;
++
++  llama_backend_init();
++  llama_numa_init(params.numa);
++
++  common_init_result llama_init = common_init_from_params(params);
++
++  llama_model* model = llama_init.model.get();
++  llama_context* ctx = llama_init.context.get();
++
++  if (model == NULL) {
++    LOG_ERR("%s: unable to load model\n", __func__);
++    return 1;
++  }
++
++  const llama_vocab* vocab = llama_model_get_vocab(model);
++
++  const int n_ctx_train = llama_model_n_ctx_train(model);
++  const int n_ctx = llama_n_ctx(ctx);
++
++  const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
++
++  if (llama_model_has_encoder(model) && llama_model_has_decoder(model)) {
++    LOG_ERR(
++        "%s: computing embeddings in encoder-decoder models is not supported\n",
++        __func__);
++    return 1;
++  }
++
++  if (n_ctx > n_ctx_train) {
++    LOG_WRN(
++        "%s: warning: model was trained on only %d context tokens (%d "
++        "specified)\n",
++        __func__, n_ctx_train, n_ctx);
++  }
++
++  // split the prompt into lines
++  std::vector<std::string> prompts = split_lines(prompt, params.embd_sep);
++
++  // max batch size
++  const uint64_t n_batch = params.n_batch;
++  GGML_ASSERT(params.n_batch >= params.n_ctx);
++
++  // tokenize the prompts and trim
++  std::vector<std::vector<int32_t>> inputs;
++  for (const auto& prompt : prompts) {
++    auto inp = common_tokenize(ctx, prompt, true, true);
++    if (inp.size() > n_batch) {
++      LOG_ERR(
++          "%s: number of tokens in input line (%lld) exceeds batch size "
++          "(%lld), increase batch size and re-run\n",
++          __func__, (long long int)inp.size(), (long long int)n_batch);
++      return 1;
++    }
++    inputs.push_back(inp);
++  }
++
++  // check if the last token is SEP
++  // it should be automatically added by the tokenizer when
++  // 'tokenizer.ggml.add_eos_token' is set to 'true'
++  for (auto& inp : inputs) {
++    if (inp.empty() || inp.back() != llama_vocab_sep(vocab)) {
++      LOG_WRN("%s: last token in the prompt is not SEP\n", __func__);
++      LOG_WRN(
++          "%s: 'tokenizer.ggml.add_eos_token' should be set to 'true' in the "
++          "GGUF header\n",
++          __func__);
++    }
++  }
++
++  // initialize batch
++  n_prompts = prompts.size();
++  struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
++
++  // count number of embeddings
++  int n_embd_count = 0;
++  if (pooling_type == LLAMA_POOLING_TYPE_NONE) {
++    for (int k = 0; k < n_prompts; k++) {
++      n_embd_count += inputs[k].size();
++    }
++  } else {
++    n_embd_count = n_prompts;
++  }
++
++  // allocate output
++  n_embd = llama_model_n_embd(model);
++  embeddings.resize(n_embd_count * n_embd, 0);
++  float* emb = embeddings.data();
++
++  // break into batches
++  int e = 0;  // number of embeddings already stored
++  int s = 0;  // number of prompts in current batch
++  for (int k = 0; k < n_prompts; k++) {
++    // clamp to n_batch tokens
++    auto& inp = inputs[k];
++
++    const uint64_t n_toks = inp.size();
++
++    // encode if at capacity
++    if (batch.n_tokens + n_toks > n_batch) {
++      float* out = emb + e * n_embd;
++      batch_decode(ctx, batch, out, s, n_embd, params.embd_normalize);
++      e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.n_tokens : s;
++      s = 0;
++      common_batch_clear(batch);
++    }
++
++    // add to batch
++    batch_add_seq(batch, inp, s);
++    s += 1;
++  }
++
++  // final batch
++  float* out = emb + e * n_embd;
++  batch_decode(ctx, batch, out, s, n_embd, params.embd_normalize);
++  llama_perf_context_print(ctx);
++
++  // clean up
++  llama_batch_free(batch);
++  llama_backend_free();
++
++  return 0;
++}
++
++std::vector<std::vector<float>> embedding(const std::string& prompt) {
++  int n_embd = 0;
++  int n_prompts = 0;
++  std::vector<float> embeddings;
++  int ret = embedding_utils(prompt, embeddings, n_embd, n_prompts);
++  if (ret != 0) {
++    LOG_ERR("%s: failed to embed prompt\n", __func__);
++    return std::vector<std::vector<float>>();
++  }
++  std::vector<std::vector<float>> out_embeddings;
++  out_embeddings.resize(n_prompts, std::vector<float>(n_embd));
++  for (int i = 0; i < n_prompts; i++) {
++    out_embeddings[i] = std::vector<float>(
++        embeddings.begin() + i * n_embd, embeddings.begin() + (i + 1) * n_embd);
++  }
++  return out_embeddings;
++}
++
++std::vector<float> embedding_single(const std::string& prompt) {
++  // if '\n' exists in prompt, return empty vector
++  if (prompt.find('\n') != std::string::npos) {
++    return std::vector<float>();
++  }
++  auto embeddings = embedding(prompt);
++  if (embeddings.empty()) {
++    return std::vector<float>();
++  }
++  return embeddings[0];
++}
++
++std::vector<std::vector<float>> embedding_batch(const std::string& prompts) {
++  return embedding(prompts);
++}
+diff --git a/embedding/embedding.h b/embedding/embedding.h
+new file mode 100644
+index 0000000..dbdfcd1
+--- /dev/null
++++ b/embedding/embedding.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <algorithm>
++#include <ctime>
++#include <numeric>
++#include <string>
++#include <vector>
++
++#include "common.h"
++#include "llama.h"
++#include "log.h"
++
++std::string join(const std::vector<std::string>& vec,
++                 const std::string& delimiter);
++
++std::vector<std::vector<float>> embedding(const std::string& prompt);
++
++std::vector<float> embedding_single(const std::string& prompt);
++
++std::vector<std::vector<float>> embedding_batch(const std::string& prompts);
+diff --git a/embedding/embedding.md b/embedding/embedding.md
+new file mode 100644
+index 0000000..0cfda60
+--- /dev/null
++++ b/embedding/embedding.md
+@@ -0,0 +1,80 @@
++# Embedding
++
++**在本次实验中, 你不需要写任何代码, 只需要成功编译并探究一些问题**
++
++## LLAMA.CPP
++
++**LLAMA.cpp** 是一个基于 C/C++ 的高性能推理框架, 专门用于在本地 CPU/GPU 上高效运行 **Meta（原 Facebook）的 LLaMA 系列大语言模型（LLM）** 及其衍生模型（如 Alpaca、Vicuna、Mistral 等）。它采用 **量化技术**（如 4-bit、5-bit、8-bit 等）来减少模型大小和内存占用, 同时保持较高的推理速度。
++
++**LLAMA.cpp** 需要使用gguf格式的模型, 我们已经为你提供了一个gguf格式的模型, 你可以在 `model` 目录下找到。
++
++## TASK
++
++### add submodule for LLAMA.CPP
++
++```bash
++git init (如果git已初始化可以跳过)
++git submodule add https://gitee.com/ShadowNearby/llama.cpp.git third_party/llama.cpp
++```
++
++### 编译LLAMA.CPP
++
++```bash
++cmake -B build
++cmake --build build --parallel
++```
++
++### 运行测试
++
++```bash
++./build/test/Embedding_Test
++```
++
++### 探究
++
++首先, 你应该根据源代码和输出的 LOG 探究, 在运行测试的过程中, 整个程序都发生了什么？(**但是不要深入 `LLAMA.CPP` 的源代码内部**)
++
++以下这些测试包含的 **语义** 是什么？
++
++```cpp
++if (sim_matrix["Apple"]["Banana"] > sim_matrix["Apple"]["Man"]) {
++  passed_count++;
++}
++if (sim_matrix["Apple"]["Orange"] > sim_matrix["Apple"]["Chicken"]) {
++  passed_count++;
++}
++if (sim_matrix["Banana"]["Orange"] > sim_matrix["Banana"]["Man"]) {
++  passed_count++;
++}
++```
++
++```cpp
++if (max_sim_sentence != supposed_sentence) {
++  std::cerr << "Failed to find the correct sentence" << std::endl;
++  return passed_count;
++}
++passed_count++;
++```
++
++**再次强调：不要深入 `LLAMA.CPP` 的源代码内部, 内部非常复杂**
++
++### 优化(不计入成绩)
++
++1. 如果你有 `NVIDIA GPU`, 可以使用 `CUDA` 加速 `LLAMA.CPP`, 对比与 `CPU` 版本的运行时间
++2. 修改配置参数, 例如：
++    - `MODEL`
++    - `NGL`
++    - `BATCH_SIZE`
++    - `CONTEXT_SIZE`
++  对比修改前后的运行时间, 探究这些参数起到了什么作用
++
++### Others(不计入成绩)
++
++1. 根据 `LLAMA.CPP` 的 `third_party/llama.cpp/examples/simple-chat` 探索 `Chat` 模式, 选择一个参数量较小的模型, 运行 `Chat` 模式, 并测试其效果
++2. 将 `test` 中的 `Embedding_Test` 中的上下文作为 `Chat` 模式的输入, 找到合适的 `prompt`, 运行 `Chat` 模式, 并测试其效果。
++
++## handout
++
++你只需要提交一个 `pdf` 文档, 包含探究部分你的回答。
++
++报告应为 `pdf` 格式, 命名为 `学号_姓名.pdf`, 例如 `523030912345_张三.pdf`
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+new file mode 100644
+index 0000000..7876cae
+--- /dev/null
++++ b/test/CMakeLists.txt
+@@ -0,0 +1,3 @@
++add_executable(Embedding_Test Embedding_Test.cpp)
++
++target_link_libraries(Embedding_Test PUBLIC embedding)
+diff --git a/test/Embedding_Test.cpp b/test/Embedding_Test.cpp
+new file mode 100644
+index 0000000..64887b8
+--- /dev/null
++++ b/test/Embedding_Test.cpp
+@@ -0,0 +1,123 @@
++#include <fstream>
++#include <iostream>
++#include <map>
++
++#include "embedding.h"
++
++int basic() {
++  std::vector<std::string> words{"Apple", "Banana", "Orange",
++                                 "Watch", "Man",    "Chicken"};
++  std::string prompt;
++  std::string joined = join(words, "\n");
++  std::vector<std::vector<float>> vec = embedding(joined);
++  if (vec.empty()) {
++    std::cerr << "Failed to embed the prompt" << std::endl;
++    return 1;
++  }
++
++  size_t n_embd = vec[0].size();
++  size_t n_prompts = vec.size();
++  std::map<std::string, std::map<std::string, float>> sim_matrix;
++  for (int i = 0; i < n_prompts; i++) {
++    for (int j = 0; j < n_prompts; j++) {
++      float sim =
++          common_embd_similarity_cos(vec[i].data(), vec[j].data(), n_embd);
++      sim_matrix[words[i]][words[j]] = sim;
++    }
++  }
++
++  int passed_count = 0;
++
++  if (sim_matrix["Apple"]["Banana"] > sim_matrix["Apple"]["Man"]) {
++    passed_count++;
++  }
++  if (sim_matrix["Apple"]["Orange"] > sim_matrix["Apple"]["Chicken"]) {
++    passed_count++;
++  }
++  if (sim_matrix["Banana"]["Orange"] > sim_matrix["Banana"]["Man"]) {
++    passed_count++;
++  }
++
++  return passed_count;
++}
++
++int large() {
++  int passed_count = 0;
++  const int max_size = 1024 * 128;
++  int read_size = 0;
++  std::ifstream file("./data/trimmed_text.txt");
++  if (!file.is_open()) {
++    std::cerr << "Failed to open the file" << std::endl;
++    return passed_count;
++  }
++  std::string line;
++  std::string prompt;
++  std::vector<std::string> sentences;
++  while (std::getline(file, line)) {
++    if (line.empty()) continue;
++    prompt += line + "\n";
++    sentences.push_back(line);
++    read_size += line.size();
++    if (read_size > max_size) {
++      break;
++    }
++  }
++  prompt.pop_back();
++  std::vector<std::vector<float>> vec = embedding(prompt);
++  if (vec.empty()) {
++    std::cerr << "Failed to embed the prompt" << std::endl;
++    return passed_count;
++  }
++  passed_count++;
++  const std::string chat_prompt =
++      "What did Ward do and what did he won in Michigan High School?";
++  std::vector<std::vector<float>> chat_vec = embedding(chat_prompt);
++  if (chat_vec.empty()) {
++    std::cerr << "Failed to embed the chat prompt" << std::endl;
++    return passed_count;
++  }
++  passed_count++;
++
++  float max_sim = 0;
++  std::string max_sim_sentence;
++  size_t n_embd = vec[0].size();
++  size_t n_prompts = vec.size();
++
++  for (int i = 0; i < n_prompts; i++) {
++    float sim =
++        common_embd_similarity_cos(vec[i].data(), chat_vec[0].data(), n_embd);
++    if (sim > max_sim) {
++      max_sim = sim;
++      max_sim_sentence = sentences[i];
++    }
++  }
++
++  std::string supposed_sentence =
++      "Ward was the Michigan High School Athlete of the Year, after setting a "
++      "national prep record in the high jump. At the University of Michigan, "
++      "he was a collegiate champion in the high jump, the long jump, the "
++      "100-yard dash, and the 440-yard dash, and finished second in the voting "
++      "for the Associated Press Big Ten Athlete of the Year award in 1933. In "
++      "track and field he was a three-time All-American and eight-time Big Ten "
++      "champion.";
++  if (max_sim_sentence != supposed_sentence) {
++    std::cerr << "Failed to find the correct sentence" << std::endl;
++    return passed_count;
++  }
++  passed_count++;
++  return passed_count;
++}
++
++int main() {
++  int passed_count = 0;
++  const int max_grade = 6;
++  passed_count += basic();
++  passed_count += large();
++  if (passed_count != max_grade) {
++    std::cerr << "Failed to pass all tests" << std::endl;
++  }
++  if (passed_count == max_grade) {
++    std::cout << "All tests passed" << std::endl;
++  }
++  return 0;
++}
+diff --git a/third_party/llama.cpp b/third_party/llama.cpp
+new file mode 160000
+index 0000000..e07d8fe
+--- /dev/null
++++ b/third_party/llama.cpp
+@@ -0,0 +1 @@
++Subproject commit e07d8feacc1fddb686e158c0597dfbb7592caa1a
