@@ -45,7 +45,7 @@ int large() {
   int passed_count = 0;
   const int max_size = 1024 * 128;
   int read_size = 0;
-  std::ifstream file("./testdata/data/trimmed_text.txt");
+  std::ifstream file("./data/trimmed_text.txt");
   if (!file.is_open()) {
     std::cerr << "Failed to open the file" << std::endl;
     return passed_count;

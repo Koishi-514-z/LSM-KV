@@ -29,14 +29,26 @@ struct ele {
     ele(uint64_t k, const std::string &v, uint64_t t, int l) : key(k), value(v), time(t), level(l) {}
     ele() : key(0), value(""), time(0), level(0) {}
 
-    bool operator< (const ele &b) const {
-        if(key == b.key) {
-            if(level == b.level) {
-                return time > b.time;
+    bool operator< (const ele &other) const {
+        if(key == other.key) {
+            if(level == other.level) {
+                return time > other.time;
             }
-            return level < b.level;
+            return level < other.level;
         }
-        return key < b.key;
+        return key < other.key;
+    }
+};
+
+struct vecele {
+    uint64_t key;
+    std::vector<float> vec;
+
+    vecele(uint64_t k, std::vector<float> v) : key(k), vec(v) {}
+    vecele() : key(0), vec(std::vector<float>()) {}
+
+    bool operator== (uint64_t otherKey) {
+        return key == otherKey;
     }
 };
 

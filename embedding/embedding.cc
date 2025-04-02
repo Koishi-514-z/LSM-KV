@@ -98,6 +98,9 @@ static void batch_decode(llama_context* ctx, llama_batch& batch, float* output,
 
 int embedding_utils(const std::string& prompt, std::vector<float>& embeddings,
                     int& n_embd, int& n_prompts) {
+                      
+  common_log_pause(common_log_main());
+
   common_params params;
 
   common_init();

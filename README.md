@@ -70,9 +70,9 @@ $$
 请确保你的环境中已经安装了 `cmake`和C++编译器。
 
 ```
-cmake -B build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-./build/test/...
+./build/test/E2E_test
 ```
  
 

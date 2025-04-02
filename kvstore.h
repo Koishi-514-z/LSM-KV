@@ -19,6 +19,8 @@ private:
     std::vector<sstablehead> sstableIndex[15]; // the sshead for each level
 
     int totalLevel = -1; // 层数
+
+    std::vector<vecele> vecArray;   // 存储各个元素对应的向量信息，用于knn查找
 public:
     KVStore(const std::string &dir);
 

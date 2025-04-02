@@ -78,6 +78,15 @@ void KVStore::put(uint64_t key, const std::string &val) {
         compaction();
         s->insert(key, val);
     }
+
+    std::vector<std::vector<float>> new_vec = embedding(val);
+    std::vector<vecele>::iterator it = std::find(vecArray.begin(), vecArray.end(), key);
+    if (it == vecArray.end()) {
+        vecArray.emplace_back(vecele(key, new_vec[0]));
+    }
+    else {
+        *it = vecele(key, new_vec[0]);
+    }
 }
 
 /**
@@ -135,9 +144,15 @@ std::string KVStore::get(uint64_t key) //
  */
 bool KVStore::del(uint64_t key) {
     std::string res = get(key);
+
     if (!res.length())
         return false; // not exist
+
     put(key, DEL);    // put a del marker
+
+    std::vector<vecele>::iterator it = std::find(vecArray.begin(), vecArray.end(), key);
+    vecArray.erase(it);
+
     return true;
 }
 
@@ -158,6 +173,7 @@ void KVStore::reset() {
         utils::rmdir(path.data());
         sstableIndex[level].clear();
     }
+    vecArray.clear();
     totalLevel = -1;
 }
 
@@ -261,7 +277,7 @@ int maxLimit(int level) {
 
 void Merge(std::vector<ele> &eleArr, std::vector<ele> &tmpArr, int startIndex, int midIndex, int endIndex){
     int i = startIndex, j = midIndex + 1, k = startIndex;
-    while(i <= midIndex && j <= endIndex) {
+    while (i <= midIndex && j <= endIndex) {
         if(eleArr[j] < eleArr[i]) {
             tmpArr[k++] = eleArr[j++];
         }
@@ -270,21 +286,21 @@ void Merge(std::vector<ele> &eleArr, std::vector<ele> &tmpArr, int startIndex, i
         }
     }
 
-    while(i <= midIndex) {
+    while (i <= midIndex) {
         tmpArr[k++] = eleArr[i++];
     }
-    while(j <= endIndex) {
+    while (j <= endIndex) {
         tmpArr[k++] = eleArr[j++];
     }
 
-    for(i = startIndex; i <= endIndex; ++i) {
+    for (i = startIndex; i <= endIndex; ++i) {
         eleArr[i] = tmpArr[i];
     }  
 }
 
 void MergeSort(std::vector<ele> &eleArr, std::vector<ele> &tmpArr, int startIndex, int endIndex) {
     int midIndex;
-    if(startIndex < endIndex) {
+    if (startIndex < endIndex) {
         midIndex = startIndex + (endIndex - startIndex) / 2;
         MergeSort(eleArr, tmpArr, startIndex, midIndex);
         MergeSort(eleArr, tmpArr, midIndex + 1, endIndex);
@@ -293,7 +309,7 @@ void MergeSort(std::vector<ele> &eleArr, std::vector<ele> &tmpArr, int startInde
 }
 
 void removeDup(std::vector<ele> &eleArr) {
-    for(auto it = eleArr.begin(); it != eleArr.end();) {
+    for (auto it = eleArr.begin(); it != eleArr.end();) {
         auto it2 = it + 1;
         while(it2 != eleArr.end() && it->key == it2->key) {
             it2 = eleArr.erase(it2);
@@ -303,7 +319,7 @@ void removeDup(std::vector<ele> &eleArr) {
 }
 
 void removeDel(std::vector<ele> &eleArr) {
-    for(auto it = eleArr.begin(); it != eleArr.end();) {
+    for (auto it = eleArr.begin(); it != eleArr.end();) {
         if(it->value == DEL) {
             it = eleArr.erase(it);
         }
@@ -316,7 +332,7 @@ void removeDel(std::vector<ele> &eleArr) {
 std::vector<sstablehead>::iterator findMin(std::vector<sstablehead> &ssh) {
     auto minSst = ssh.begin();
     for (auto it = ssh.begin(); it != ssh.end(); ++it) {
-        if(*it < *minSst) {
+        if (*it < *minSst) {
             minSst = it;
         }
     }
@@ -326,15 +342,15 @@ std::vector<sstablehead>::iterator findMin(std::vector<sstablehead> &ssh) {
 
 void KVStore::generateSST(const std::vector<ele> &eleArr, int level) {
     sstable ss(level);
-    for(ele it : eleArr) { 
-        if(ss.checkSize(it.value, level)) {
+    for (ele it : eleArr) { 
+        if (ss.checkSize(it.value, level)) {
             ss.addNewSst(level);
             addsstable(ss, level);
             ss.reset();
         }
         ss.insert(it.key, it.value);
     }
-    if(ss.getCnt()) {
+    if (ss.getCnt()) {
         ss.addNewSst(level);
         addsstable(ss, level);
     }
@@ -342,26 +358,26 @@ void KVStore::generateSST(const std::vector<ele> &eleArr, int level) {
 
 
 void KVStore::compaction() {
-    for(int level = 0; level <= totalLevel; ++level) {
-        if(sstableIndex[level].size() <= maxLimit(level)) {
+    for (int level = 0; level <= totalLevel; ++level) {
+        if (sstableIndex[level].size() <= maxLimit(level)) {
             break;
         }
         uint64_t minKey = INF, maxKey = -1;
         std::vector<ele> eleArr;
 
-        if(level == totalLevel) {
+        if (level == totalLevel) {
             ++totalLevel;
             std::string path = "./data/level-" + std::to_string(totalLevel);
             utils::mkdir(path.data());
         }
 
-        if(level == 0) {
+        if (level == 0) {
             for (auto it = sstableIndex[0].begin(); it != sstableIndex[0].end();) {
                 minKey = std::min(minKey, it->getMinV());
                 maxKey = std::max(maxKey, it->getMaxV());
                 sstable ss;
                 ss.loadFile(it->getFilename().data());
-                for(int i = 0; i < ss.getCnt(); ++i) {
+                for (int i = 0; i < ss.getCnt(); ++i) {
                     ele e(ss.getKey(i), ss.getData(i), ss.getTime(), 0);
                     eleArr.emplace_back(e);
                 }
@@ -369,13 +385,13 @@ void KVStore::compaction() {
             }
         }
         else {
-            for(int i = 0; i < sstableIndex[level].size() - maxLimit(level); ++i) {
+            for (int i = 0; i < sstableIndex[level].size() - maxLimit(level); ++i) {
                 auto it = findMin(sstableIndex[level]);
                 minKey = std::min(minKey, it->getMinV());
                 maxKey = std::max(maxKey, it->getMaxV());
                 sstable ss;
                 ss.loadFile(it->getFilename().data());
-                for(int i = 0; i < ss.getCnt(); ++i) {
+                for (int i = 0; i < ss.getCnt(); ++i) {
                     ele e(ss.getKey(i), ss.getData(i), ss.getTime(), level);
                     eleArr.emplace_back(e);
                 }
@@ -384,7 +400,7 @@ void KVStore::compaction() {
         }
 
         for (auto it = sstableIndex[level+1].begin(); it != sstableIndex[level+1].end();) {
-            if(!(it->getMaxV() < minKey || it->getMinV() > maxKey)) {
+            if (!(it->getMaxV() < minKey || it->getMinV() > maxKey)) {
                 sstable ss;
                 ss.loadFile(it->getFilename().data());
                 for(int i = 0; i < ss.getCnt(); ++i) {
@@ -466,5 +482,33 @@ std::string KVStore::fetchString(std::string file, int startOffset, uint32_t len
 }
 
 std::vector<std::pair<std::uint64_t, std::string>> KVStore::search_knn(std::string query, int k) {
-    
+    std::vector<std::pair<std::uint64_t, std::string>> ans;
+    std::vector<std::pair<std::uint64_t, float>> sim;
+    std::vector<std::vector<float>> query_vec = embedding(query);
+    size_t n_embd = query_vec[0].size();
+
+    //  遍历计算各个元素与query的相似度
+    for (auto it = vecArray.begin(); it != vecArray.end(); ++it) {  
+        std::pair<std::uint64_t, float> p(it->key, common_embd_similarity_cos(it->vec.data(), query_vec[0].data(), n_embd));
+        sim.emplace_back(p);
+    }
+
+    //  找到相似度前k大的元素
+    for (int i = 0; i < k; ++i) {   
+        std::vector<std::pair<std::uint64_t, float>>::iterator maxele = sim.begin();
+        for (auto it = sim.begin(); it != sim.end(); ++it) {
+            if (it->second > maxele->second) {
+                maxele = it;
+            }
+        }
+        ans.emplace_back(std::pair<std::uint64_t, std::string> (maxele->first, ""));
+        sim.erase(maxele);
+    }
+
+    //  从磁盘中读出k个元素的value
+    for (auto it = ans.begin(); it != ans.end(); ++it) {
+        it->second = get(it->first);
+    }
+
+    return ans;
 }
